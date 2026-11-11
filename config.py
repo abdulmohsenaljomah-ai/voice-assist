@@ -1,76 +1,82 @@
-"""Configuration for the Marco voice assistant.
+"""Configuration for Marcos, the Arabic voice assistant.
 
-All hardcoded values that were previously scattered in agent.py are
-centralised here so they can be tuned without touching code.
+Every tunable value lives here so behaviour can be changed without
+touching the pipeline code.
 """
 
 import logging
-import os
 from pathlib import Path
 
 # ------------------------------------------------------------------
 # Paths
 # ------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).parent
-CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+LOG_DIR = PROJECT_ROOT / "logs"
+LOG_FILE = LOG_DIR / "marcos.log"
+LATENCY_CSV = LOG_DIR / "latency.csv"
+LOG_LEVEL = logging.INFO
 
 # ------------------------------------------------------------------
-# LLM / Ollama
+# LLM (local, via Ollama)
 # ------------------------------------------------------------------
 OLLAMA_MODEL = "deepseek-r1:8b"
-LLM_TIMEOUT = 30  # seconds
+LLM_TIMEOUT = 30          # seconds per request
 LLM_MAX_RETRIES = 3
+HISTORY_TURNS = 6         # user/assistant pairs kept as short-term memory
 
 # ------------------------------------------------------------------
 # Speech-to-Text (faster-whisper)
 # ------------------------------------------------------------------
 WHISPER_MODEL = "small"
-WHISPER_DEVICE = "cuda"        # falls back to "cpu" if CUDA unavailable
+WHISPER_DEVICE = "cuda"           # falls back to CPU automatically
 WHISPER_COMPUTE_TYPE = "float16"
 WHISPER_LANGUAGE = "ar"
 SAMPLE_RATE = 16000
 
 # ------------------------------------------------------------------
-# Audio / Wake-word
+# Wake word
 # ------------------------------------------------------------------
-WAKE_WORD = "marcos"
-LISTEN_DURATION_WAKE = 3   # seconds for passive listening
-LISTEN_DURATION_COMMAND = 10  # seconds after wake word
+# Whisper is forced to Arabic, so it usually writes the name in Arabic
+# script. Accept the common spellings in both scripts.
+WAKE_WORDS = ["ماركوس", "ماركس", "مركوس", "marcos", "markos", "marcus"]
+WAKE_LISTEN_SECONDS = 2.5         # rolling window while waiting for the wake word
 
 # ------------------------------------------------------------------
-# Logging
+# Voice activity detection (end-of-turn)
 # ------------------------------------------------------------------
-LOG_LEVEL = logging.INFO
-LOG_FILE = PROJECT_ROOT / "logs" / "marco.log"
+VAD_FRAME_MS = 30                 # analysis frame size
+VAD_CALIBRATION_SECONDS = 0.6     # ambient-noise measurement at start-up
+VAD_THRESHOLD_MULTIPLIER = 3.0    # speech = energy > noise_floor * multiplier
+VAD_MIN_THRESHOLD = 0.004         # never go below this RMS (quiet rooms)
+VAD_END_SILENCE_MS = 800          # this much silence after speech ends the turn
+VAD_START_TIMEOUT_SECONDS = 5     # give up if the user never starts speaking
+VAD_MAX_UTTERANCE_SECONDS = 15    # hard cap on one utterance
+VAD_PRE_ROLL_MS = 300             # audio kept from just before speech starts
 
 # ------------------------------------------------------------------
-# Command safety
+# Text-to-Speech (pyttsx3 / Windows SAPI)
 # ------------------------------------------------------------------
-# Commands that are completely forbidden and will never execute.
-FORBIDDEN_PATTERNS = [
-    "shutdown",
-    "restart",
-    "power off",
-    "diskpart",
-    "cipher /w",
-    "format",
-]
-
-# Commands that require explicit user confirmation before execution.
-# These are NOT blocked outright — the assistant asks "are you sure?"
-CONFIRMATION_REQUIRED_PATTERNS = [
-    "del ",
-    "rd ",
-    "rmdir",
-    "deltree",
-    "erase",
-]
+TTS_RATE = 165
+TTS_VOLUME = 1.0
+# Substrings used to pick an Arabic SAPI voice if one is installed
+# (e.g. "Microsoft Naayf" / "Microsoft Hoda").
+TTS_VOICE_HINTS = ["arabic", "ar-sa", "ar_sa", "naayf", "hoda"]
 
 # ------------------------------------------------------------------
-# Internal helper
+# Tools
 # ------------------------------------------------------------------
-def _ensure_log_dir() -> None:
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-if os.environ.get("MARCO_LOG_DIR"):
-    _ensure_log_dir()
+# The LLM can only open applications from this allowlist.
+# Spoken name (Arabic or English) -> Windows executable / URI.
+APP_ALLOWLIST = {
+    "calculator": "calc.exe",
+    "الحاسبة": "calc.exe",
+    "notepad": "notepad.exe",
+    "المفكرة": "notepad.exe",
+    "paint": "mspaint.exe",
+    "الرسام": "mspaint.exe",
+    "explorer": "explorer.exe",
+    "مستكشف الملفات": "explorer.exe",
+    "settings": "ms-settings:",
+    "الإعدادات": "ms-settings:",
+}
+SEARCH_URL = "https://www.google.com/search?q={query}"
