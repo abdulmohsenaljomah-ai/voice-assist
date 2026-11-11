@@ -1,192 +1,108 @@
-"""ماركوس – Arabic voice assistant for Windows (development edition).
+"""Marcos – Arabic voice assistant (entry point).
 
-Target environment: Windows PC with NVIDIA GPU + local Ollama.
-This file is the main entry point.  See README.md for setup instructions.
+Pipeline per turn:
+    mic --VAD--> faster-whisper (STT) --> local LLM via Ollama
+        --> [allowlisted tool] --> pyttsx3 (TTS)
+Each stage is timed and logged to logs/latency.csv.
 """
+
+from __future__ import annotations
 
 import logging
 import sys
-import time
-
-import ollama
-import pyttsx3
-import sounddevice as sd
-from faster_whisper import WhisperModel
 
 import config as cfg
-from command_executor import execute, ExecutionResult, RiskLevel
-
-# ------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------
-logging.basicConfig(
-    level=cfg.LOG_LEVEL,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-# Optional: also write to file if logs directory exists
-try:
-    cfg._ensure_log_dir()
-    logging.getLogger().addHandler(logging.FileHandler(cfg.LOG_FILE))
-except Exception:
-    pass
-
-log = logging.getLogger("marco")
-
-# ------------------------------------------------------------------
-# TTS
-# ------------------------------------------------------------------
-engine = pyttsx3.init()
-engine.setProperty('rate', 150)
-engine.setProperty('volume', 1.0)
+from marcos.metrics import LatencyLog, TurnTimer
+from marcos.text import contains_wake_word, normalize_arabic, parse_reply
+from marcos.tools import Toolbox
 
 
-def speak(text: str) -> None:
-    """Speak *text* aloud and also print it."""
-    clean = text.split("```")[-1].strip()
-    log.info(f"🔊 ماركوس: {clean}")
-    engine.say(clean)
-    engine.runAndWait()
-
-
-# ------------------------------------------------------------------
-# STT (Whisper)
-# ------------------------------------------------------------------
-print("⏳ جاري تحميل Whisper...")
-try:
-    whisper = WhisperModel(
-        cfg.WHISPER_MODEL,
-        device=cfg.WHISPER_DEVICE,
-        compute_type=cfg.WHISPER_COMPUTE_TYPE,
+def setup_logging() -> None:
+    cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=cfg.LOG_LEVEL,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout),
+                  logging.FileHandler(cfg.LOG_FILE, encoding="utf-8")],
     )
-except Exception as e:
-    log.error(f"Failed to initialise Whisper on CUDA: {e}")
-    log.info("Falling back to CPU.")
-    try:
-        whisper = WhisperModel(
-            cfg.WHISPER_MODEL,
-            device="cpu",
-            compute_type="int8",
-        )
-    except Exception as e2:
-        log.critical(f"Whisper could not be loaded at all: {e2}")
-        speak("لم أتمكن من تشغيل نظام التعرف على الكلام")
-        sys.exit(1)
-
-print("✅ Whisper جاهز!")
 
 
-def listen(duration: int = cfg.LISTEN_DURATION_WAKE) -> str:
-    """Record *duration* seconds of audio and return lowercased AR text."""
-    try:
-        audio = sd.rec(
-            int(duration * cfg.SAMPLE_RATE),
-            samplerate=cfg.SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-        )
-        sd.wait()
-        audio_np = audio.flatten()
-        segments, _ = whisper.transcribe(audio_np, language=cfg.WHISPER_LANGUAGE)
-        text = " ".join([s.text for s in segments])
-        log.info(f"📝 سمعت: {text}")
-        return text.strip().lower()
-    except Exception as e:
-        log.error(f"Error in listen(): {e}")
-        return ""
+def command_after_wake_word(transcript: str) -> str:
+    """'ماركوس افتح الحاسبة' -> 'افتح الحاسبة' (lets users speak in one breath)."""
+    wake = {normalize_arabic(w) for w in cfg.WAKE_WORDS}
+    words = transcript.split()
+    for i, word in enumerate(words):
+        if normalize_arabic(word) in wake:
+            return " ".join(words[i + 1:]).strip()
+    return ""
 
 
-# ------------------------------------------------------------------
-# LLM (Ollama)
-# ------------------------------------------------------------------
-SYSTEM_PROMPT = """أنت وكيل ذكاء اصطناعي اسمك ماركوس تتحكم بجهاز Windows.
-عندما يطلب المستخدم شيئاً، رد بطريقتين فقط:
-١. إذا الطلب يحتاج تنفيذ على الجهاز: رد هكذا بالضبط في سطر واحد: CMD: الأمر
-مثال: CMD: start calc
-مثال: CMD: start https://youtube.com
-مثال: CMD: start notepad
-٢. إذا سؤال أو محادثة: رد بالعربية مباشرة بدون CMD
-مهم جداً: رد بإيجاز، جملة أو جملتين فقط، لا تفكر بصوت عالٍ"""
+class Assistant:
+    def __init__(self) -> None:
+        # Heavy imports happen here so the pure modules stay testable.
+        from marcos.audio import Recorder
+        from marcos.llm import LLM
+        from marcos.stt import Transcriber
+        from marcos.tts import Speaker
 
+        self.log = logging.getLogger("marcos")
+        self.speaker = Speaker()
+        self.log.info("Loading speech recognition…")
+        self.stt = Transcriber()
+        self.recorder = Recorder()
+        self.llm = LLM()
+        self.tools = Toolbox()
+        self.latency = LatencyLog(cfg.LATENCY_CSV)
 
-def ask_ollama(prompt: str) -> str:
-    """Send *prompt* to the local Ollama LLM and return the reply."""
-    for attempt in range(cfg.LLM_MAX_RETRIES):
+    def handle(self, user_text: str, timer: TurnTimer) -> None:
+        with timer.stage("llm"):
+            reply = parse_reply(self.llm.ask(user_text))
+
+        if reply.is_tool_call:
+            with timer.stage("tool"):
+                result = self.tools.run(reply.tool, reply.args)
+            self.log.info("🔧 %s(%s) -> %s", reply.tool, reply.args, result.message)
+            answer = result.message
+        else:
+            answer = reply.speech or "عذراً، ما قدرت أجاوب الحين."
+
+        self.llm.remember(user_text, answer)
+        with timer.stage("tts"):
+            self.speaker.say(answer)
+
+    def run(self) -> None:
+        self.recorder.calibrate()
+        self.speaker.say("مرحبا، أنا ماركوس جاهز")
+        self.log.info("Say 'ماركوس' (Marcos) to start.")
         try:
-            response = ollama.chat(
-                model=cfg.OLLAMA_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                timeout=cfg.LLM_TIMEOUT,
-            )
-            return response['message']['content']
-        except Exception as e:
-            log.warning(f"Ollama attempt {attempt + 1}/{cfg.LLM_MAX_RETRIES} failed: {e}")
-            if attempt < cfg.LLM_MAX_RETRIES - 1:
-                time.sleep(1)
-            else:
-                log.error("All Ollama retries exhausted.")
-                return "عذراً، الخدمة غير متاحة الآن."
+            while True:
+                heard = self.stt.transcribe(
+                    self.recorder.record_utterance(start_timeout_s=cfg.WAKE_LISTEN_SECONDS))
+                if not heard or not contains_wake_word(heard, cfg.WAKE_WORDS):
+                    continue
+
+                command = command_after_wake_word(heard)
+                if len(command) < 2:
+                    self.speaker.say("نعم؟")
+                    audio = self.recorder.record_utterance()
+                    timer = TurnTimer()  # latency is measured from end of user speech
+                    with timer.stage("stt"):
+                        command = self.stt.transcribe(audio)
+                else:
+                    timer = TurnTimer()
+
+                if len(command) < 2:
+                    self.speaker.say("ما سمعت شيئاً")
+                    continue
+                self.log.info("🎤 %s", command)
+                self.handle(command, timer)
+                row = self.latency.add(timer)
+                self.log.info("⏱️ latency ms: %s", row)
+        except KeyboardInterrupt:
+            self.log.info("Median latency this session (ms): %s", self.latency.summary())
+            self.speaker.say("مع السلامة")
 
 
-# ------------------------------------------------------------------
-# Response processing
-# ------------------------------------------------------------------
-def process_response(response: str) -> None:
-    """Parse LLM *response* and either speak it or execute a command."""
-    clean = response.split("```")[-1].strip()
-
-    if "CMD:" in clean:
-        cmd = clean.split("CMD:")[1].strip().split("\n")[0]
-        log.info(f"🔧 استلام أمر: {cmd}")
-
-        result: ExecutionResult = execute(cmd)
-
-        if result.risk == RiskLevel.FORBIDDEN or result.risk == RiskLevel.INVALID:
-            speak(result.message)
-            return
-
-        if result.risk == RiskLevel.CONFIRM_REQUIRED and not result.executed:
-            # Ask for voice confirmation
-            speak(result.message)
-            confirm = listen(duration=3)
-            if "نعم" not in confirm:
-                speak("تم الإلغاء")
-                return
-            # Re-execute with confirmation granted
-            result = execute(cmd, skip_confirmation=True)
-
-        speak(result.message)
-    else:
-        speak(clean)
-
-
-# ------------------------------------------------------------------
-# Main loop
-# ------------------------------------------------------------------
-speak("مرحبا، أنا ماركوس جاهز")
-print("✅ قل 'Marcos' لتفعيل ماركوس")
-
-while True:
-    print("👂 منتظر Marcos...")
-    trigger = listen(duration=cfg.LISTEN_DURATION_WAKE)
-
-    if cfg.WAKE_WORD not in trigger:
-        continue
-
-    speak("نعم؟")
-    print("🎤 تكلم! عندك 10 ثواني")
-    command = listen(duration=cfg.LISTEN_DURATION_COMMAND)
-
-    if not command or len(command) < 3:
-        speak("ما سمعت شيئاً")
-        continue
-
-    print(f"🎤 قلت: {command}")
-    response = ask_ollama(command)
-    print(f"🤖 الرد: {response}")
-    process_response(response)
+if __name__ == "__main__":
+    setup_logging()
+    Assistant().run()
